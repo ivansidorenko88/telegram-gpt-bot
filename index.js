@@ -1,28 +1,30 @@
 require("dotenv").config();
 
-const TelegramBot = require("node-telegram-bot-api");
+const { Telegraf } = require("telegraf");
 const OpenAI = require("openai");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
-  polling: true,
-});
+if (!process.env.TELEGRAM_BOT_TOKEN) {
+  throw new Error("TELEGRAM_BOT_TOKEN не указан");
+}
+
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error("OPENAI_API_KEY не указан");
+}
+
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const MODEL = process.env.OPENAI_MODEL || "gpt-5.5";
-
-// Память диалога отдельно для каждого пользователя
+const MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const memory = new Map();
 
 function getHistory(userId) {
-  if (!memory.has(userId)) {
-    memory.set(userId, []);
-  }
+  if (!memory.has(userId)) memory.set(userId, []);
   return memory.get(userId);
 }
 
@@ -30,7 +32,6 @@ function addToHistory(userId, role, content) {
   const history = getHistory(userId);
   history.push({ role, content });
 
-  // Ограничение памяти, чтобы не раздувать запрос
   if (history.length > 20) {
     history.splice(0, history.length - 20);
   }
@@ -52,20 +53,18 @@ async function askGPT(userId, text) {
   });
 
   const answer = response.output_text || "Не удалось получить ответ.";
-
   addToHistory(userId, "assistant", answer);
 
   return answer;
 }
 
-async function downloadTelegramFile(fileId) {
-  const file = await bot.getFile(fileId);
-  const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-
+async function downloadTelegramFile(ctx, fileId) {
+  const link = await ctx.telegram.getFileLink(fileId);
   const filePath = path.join(__dirname, `voice_${Date.now()}.ogg`);
+
   const response = await axios({
     method: "GET",
-    url: fileUrl,
+    url: link.href,
     responseType: "stream",
   });
 
@@ -80,62 +79,65 @@ async function downloadTelegramFile(fileId) {
   return filePath;
 }
 
-bot.onText(/\/start/, async (msg) => {
-  await bot.sendMessage(
-    msg.chat.id,
-    "Привет! Я GPT-бот в Telegram.\n\nМожешь писать текстом или отправлять голосовые сообщения.\n\nКоманды:\n/start — запуск\n/clear — очистить память диалога"
+bot.start((ctx) => {
+  ctx.reply(
+    "Привет! Я GPT-бот в Telegram.\n\nМожешь писать текстом или отправлять голосовые.\n\nКоманды:\n/start — запуск\n/clear — очистить память"
   );
 });
 
-bot.onText(/\/clear/, async (msg) => {
-  memory.delete(msg.from.id);
-  await bot.sendMessage(msg.chat.id, "Память этого диалога очищена.");
+bot.command("clear", (ctx) => {
+  memory.delete(ctx.from.id);
+  ctx.reply("Память диалога очищена.");
 });
 
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  if (msg.text && msg.text.startsWith("/")) return;
+bot.on("voice", async (ctx) => {
+  const userId = ctx.from.id;
 
   try {
-    await bot.sendChatAction(chatId, "typing");
+    await ctx.reply("Распознаю голосовое...");
 
-    let userText = msg.text;
+    const filePath = await downloadTelegramFile(ctx, ctx.message.voice.file_id);
 
-    // Голосовое сообщение
-    if (msg.voice) {
-      await bot.sendMessage(chatId, "Распознаю голосовое...");
+    const transcription = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(filePath),
+      model: "gpt-4o-transcribe",
+    });
 
-      const filePath = await downloadTelegramFile(msg.voice.file_id);
+    fs.unlinkSync(filePath);
 
-      const transcription = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(filePath),
-        model: "gpt-4o-transcribe",
-      });
-
-      fs.unlinkSync(filePath);
-
-      userText = transcription.text;
-
-      await bot.sendMessage(chatId, `Ты сказал: ${userText}`);
-    }
-
-    if (!userText) return;
+    const userText = transcription.text;
+    await ctx.reply(`Ты сказал: ${userText}`);
 
     const answer = await askGPT(userId, userText);
-
-    await bot.sendMessage(chatId, answer, {
-      parse_mode: "Markdown",
-    });
+    await ctx.reply(answer);
   } catch (error) {
     console.error(error);
+    await ctx.reply("Ошибка при обработке голосового сообщения.");
+  }
+});
 
-    await bot.sendMessage(
-      chatId,
-      "Произошла ошибка. Проверь TELEGRAM_BOT_TOKEN, OPENAI_API_KEY и баланс OpenAI."
+bot.on("text", async (ctx) => {
+  const userId = ctx.from.id;
+  const text = ctx.message.text;
+
+  if (text.startsWith("/")) return;
+
+  try {
+    await ctx.sendChatAction("typing");
+
+    const answer = await askGPT(userId, text);
+    await ctx.reply(answer);
+  } catch (error) {
+    console.error(error);
+    await ctx.reply(
+      "Ошибка при обращении к GPT. Проверь OPENAI_API_KEY, TELEGRAM_BOT_TOKEN и баланс OpenAI."
     );
   }
 });
 
+bot.launch();
+
 console.log("Telegram GPT bot запущен");
+
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
